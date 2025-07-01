@@ -36,9 +36,6 @@ env/
 *.swp
 *.swo
 
-# 패키징된 하위 모듈
-tg_session_manager/
-
 # OS
 .DS_Store
 Thumbs.db
