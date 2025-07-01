@@ -10,6 +10,7 @@
 - ✅ **2FA 지원**: 인증코드와 2차 비밀번호 모두 처리 (3회 재시도)
 - ✅ **세션 백업**: 기존 세션 덮어쓰기 시 자동 백업
 - ✅ **Base64 변환**: 세션 파일을 문자열로 변환하여 이동/공유 가능
+- ✅ **Base64 저장**: 변환된 문자열을 파일로 보관하여 손쉽게 공유
 - ✅ **로깅 시스템**: 모든 작업 내역 자동 기록
 - ✅ **보안 고려**: .gitignore로 민감 정보 보호
 
@@ -77,6 +78,7 @@ python main.py
 인증 코드 입력 (1/3): 12345
 ✓ 세션 생성 성공!
 Base64: U2Vzc2lvbkZpbGVDb250ZW50cy4uLg==...
+저장 경로: base64_strings/telethon/12345678.txt
 ```
 
 ## 📁 디렉토리 구조
@@ -87,6 +89,11 @@ tg_session_manager/
 │   ├── pyrogram/         # Pyrogram 세션
 │   ├── telegram-bot/     # Bot 세션
 │   └── tdlib/           # TDLib 세션
+├── base64_strings/       # Base64 문자열 저장
+│   ├── telethon/
+│   ├── pyrogram/
+│   ├── telegram-bot/
+│   └── tdlib/
 ├── logs/                 # 로그 파일
 ├── api_configs.json      # API 설정 (자동 생성)
 └── *.py                  # 소스 코드

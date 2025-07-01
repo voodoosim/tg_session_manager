@@ -39,6 +39,17 @@ def base64_to_session(base64_string: str, output_path: str) -> bool:
         return False
 
 
+def save_base64_string(base64_string: str, output_path: str) -> bool:
+    """base64 문자열을 파일로 저장"""
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(base64_string)
+        return True
+    except Exception as e:
+        print(f"Base64 저장 실패: {e}")
+        return False
+
+
 def validate_session_file(session_file_path: str) -> bool:
     """세션 파일 유효성 검사"""
     # 파일 존재 여부와 크기 확인

@@ -7,9 +7,13 @@ import os
 from typing import List, Dict
 from api_manager import APIManager
 from session_factory import SessionFactory
-from config import MAX_RETRY_ATTEMPTS, SESSION_DIRS
+from config import MAX_RETRY_ATTEMPTS, SESSION_DIRS, BASE64_DIRS
 from logger import SessionLogger
-from session_utils import backup_existing_session, extract_session_name
+from session_utils import (
+    backup_existing_session,
+    extract_session_name,
+    save_base64_string,
+)
 
 
 class TelegramSessionManager:
@@ -167,10 +171,17 @@ class TelegramSessionManager:
                     self.print_colored("✅ 세션 생성 성공!", "green")
                     self.logger.log_session_created(library, phone, True)
                     
-                    # Base64 문자열 생성
+                    # Base64 문자열 생성 및 저장
                     base64_str = manager.session_to_string(phone)
                     if base64_str:
                         self.print_colored(f"🔤 Base64: {base64_str[:50]}...", "cyan")
+
+                        session_name = extract_session_name(phone)
+                        output_dir = BASE64_DIRS[library]
+                        output_path = os.path.join(output_dir, f"{session_name}.txt")
+                        if save_base64_string(base64_str, output_path):
+                            self.print_colored(f"💾 저장: {os.path.basename(output_path)}", "green")
+                            self.logger.log_base64_saved(library, phone, output_path)
                     
                     return True
                     

@@ -61,7 +61,11 @@ class SessionLogger:
     def log_api_registered(self, api_name: str):
         """API 등록 로그"""
         self.logger.info(f"API 등록: {api_name}")
-    
+
     def log_error(self, error_msg: str):
         """에러 로그"""
         self.logger.error(f"에러: {error_msg}")
+
+    def log_base64_saved(self, library: str, phone: str, path: str):
+        """Base64 문자열 저장 로그"""
+        self.logger.info(f"Base64 저장: {library} - {phone} -> {path}")
