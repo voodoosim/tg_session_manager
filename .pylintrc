@@ -1,0 +1,27 @@
+[MASTER]
+init-hook='import sys; sys.path.append(".")'
+
+[MESSAGES CONTROL]
+disable=
+    missing-module-docstring,
+    missing-function-docstring,
+    missing-class-docstring,
+    too-few-public-methods,
+    import-error,
+    no-member,
+    duplicate-code,
+    redefined-outer-name,
+    cell-var-from-loop
+
+[FORMAT]
+max-line-length=100
+
+[BASIC]
+good-names=i,j,k,f,e,db,id,_
+
+[DESIGN]
+max-args=7
+min-public-methods=1
+
+[EXCEPTIONS]
+overgeneral-exceptions=builtins.BaseException,builtins.Exception

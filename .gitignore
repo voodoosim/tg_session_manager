@@ -1,0 +1,32 @@
+
+# 환경 변수
+.env
+.env.local
+
+# API 인증 정보
+data/api_credentials.json
+
+# 세션 파일
+data/sessions/
+*.session
+*.session-journal
+*.tdlib
+
+# 로그 파일
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
