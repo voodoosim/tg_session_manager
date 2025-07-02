@@ -1,0 +1,2857 @@
+=====================================
+File: ./src/tg_session_manager/__init__.py
+=====================================
+"""텔레그램 세션 관리 패키지"""
+
+# 패키지 레벨 import를 위한 설정
+__all__ = [
+    "APIManager",
+    "SessionBase",
+    "SessionFactory",
+    "TelethonSession",
+    "PyrogramSession",
+    "TelegramBotSession",
+    "TDLibSession",
+    "SessionLogger",
+    "extract_session_name",
+    "session_to_base64",
+    "base64_to_session",
+    "validate_session_file",
+    "backup_existing_session",
+]
+
+
+
+=====================================
+File: ./src/tg_session_manager/cli/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/cli/main.py
+=====================================
+"""
+메인 CLI 애플리케이션 - 전체 플로우 관리
+"""
+
+import asyncio
+import os
+import sys
+from typing import Dict, List
+
+from core.api_manager import APIManager
+from config.config import MAX_RETRY_ATTEMPTS, SESSION_DIRS
+from utils.logger import SessionLogger
+from core.session_factory import SessionFactory
+from utils.session_utils import backup_existing_session, extract_session_name
+
+
+class TelegramSessionManager:
+    """텔레그램 세션 관리 메인 클래스"""
+
+    def __init__(self):
+        self.api_manager = APIManager()
+        self.results: List[Dict] = []
+        self.logger = SessionLogger()
+
+    def print_colored(self, text: str, color: str = "white"):
+        """색상 출력 (선택적)"""
+        colors = {
+            "red": "\033[91m",
+            "green": "\033[92m",
+            "yellow": "\033[93m",
+            "blue": "\033[94m",
+            "magenta": "\033[95m",
+            "cyan": "\033[96m",
+            "white": "\033[97m",
+            "reset": "\033[0m",
+        }
+        print(f"{colors.get(color, '')}{text}{colors['reset']}")
+
+    def select_or_register_api(self) -> Dict[str, str]:
+        """API 선택 또는 등록"""
+        apis = self.api_manager.list_apis()
+
+        if apis:
+            self.print_colored("\n📋 등록된 API 목록:", "cyan")
+            for i, api_name in enumerate(apis, 1):
+                print(f"  {i}. {api_name}")
+            print(f"  {len(apis) + 1}. 새 API 등록")
+
+            choice = input("\n선택하세요: ")
+            if choice.isdigit() and 1 <= int(choice) <= len(apis):
+                api_name = apis[int(choice) - 1]
+                return self.api_manager.get_api(api_name)
+
+        # 새 API 등록
+        self.print_colored("\n🔑 새 API 등록", "yellow")
+        name = input("API 이름: ")
+        api_id = input("API ID: ")
+        api_hash = input("API Hash: ")
+
+        self.api_manager.register_api(name, api_id, api_hash)
+        self.logger.log_api_registered(name)
+        self.print_colored("✅ API 등록 완료!", "green")
+        return {"api_id": api_id, "api_hash": api_hash}
+
+    def select_libraries(self) -> List[str]:
+        """사용할 라이브러리 선택"""
+        selected = []
+
+        self.print_colored("\n📚 사용할 라이브러리를 선택하세요 (쉼표로 구분):", "cyan")
+        print("  1. Telethon (유저 세션)")
+        print("  2. Pyrogram (유저 세션)")
+        print("  3. python-telegram-bot (봇 전용)")
+        print("  4. TDLib (고성능 C++ 기반)")
+
+        choices = input("\n선택 (예: 1,2): ").split(",")
+
+        library_map = {
+            "1": "telethon",
+            "2": "pyrogram",
+            "3": "telegram-bot",
+            "4": "tdlib",
+        }
+
+        for choice in choices:
+            lib = library_map.get(choice.strip())
+            if lib:
+                selected.append(lib)
+
+        if selected:
+            self.print_colored(f"✅ 선택된 라이브러리: {', '.join(selected)}", "green")
+
+        return selected
+
+    def input_phone_numbers(self) -> List[str]:
+        """전화번호 입력"""
+        self.print_colored("\n📱 전화번호를 입력하세요 (쉼표로 구분):", "cyan")
+        print("   예) +821012345678, +821087654321")
+        phones = input("\n입력: ")
+        phone_list = [phone.strip() for phone in phones.split(",") if phone.strip()]
+
+        if phone_list:
+            self.print_colored(f"✅ 입력된 번호: {len(phone_list)}개", "green")
+
+        return phone_list
+
+    async def create_sessions(
+        self, api_config: Dict[str, str], libraries: List[str], phones: List[str]
+    ):
+        """세션 생성 메인 로직"""
+        total_tasks = len(libraries) * len(phones)
+        current_task = 0
+
+        self.print_colored(f"\n🚀 총 {total_tasks}개 세션 생성 시작...", "magenta")
+        print("=" * 60)
+
+        for library in libraries:
+            for phone in phones:
+                current_task += 1
+                self.print_colored(
+                    f"\n[{current_task}/{total_tasks}] 처리 중...", "blue"
+                )
+
+                success = await self._create_single_session(api_config, library, phone)
+
+                self.results.append(
+                    {"library": library, "phone": phone, "success": success}
+                )
+
+    async def _create_single_session(
+        self, api_config: Dict[str, str], library: str, phone: str
+    ) -> bool:
+        """단일 세션 생성"""
+        manager = SessionFactory.create_session_manager(
+            library, api_config["api_id"], api_config["api_hash"]
+        )
+
+        if not manager:
+            self.print_colored(f"❌ {library} 매니저 생성 실패", "red")
+            return False
+
+        # 기존 세션 확인 및 백업
+        session_name = extract_session_name(phone)
+        session_path = os.path.join(SESSION_DIRS[library], f"{session_name}.session")
+
+        if os.path.exists(session_path):
+            self.print_colored(f"⚠️  기존 세션 발견: {session_name}", "yellow")
+            backup_path = backup_existing_session(session_path)
+            if backup_path:
+                self.print_colored(
+                    f"💾 백업 완료: {os.path.basename(backup_path)}", "green"
+                )
+                self.logger.log_backup(session_path, backup_path)
+
+        print(f"\n🔄 [{library}] {phone} 세션 생성 중...")
+
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+
+                def code_callback():
+                    code = input(
+                        f"📲 인증 코드 입력 ({attempt + 1}/{MAX_RETRY_ATTEMPTS}): "
+                    )
+                    self.logger.log_authentication(phone, attempt + 1, bool(code))
+                    return code
+
+                def password_callback():
+                    return input(
+                        f"🔐 2FA 비밀번호 입력 ({attempt + 1}/{MAX_RETRY_ATTEMPTS}): "
+                    )
+
+                success = await manager.create_session(
+                    phone, code_callback, password_callback
+                )
+
+                if success:
+                    self.print_colored("✅ 세션 생성 성공!", "green")
+                    self.logger.log_session_created(library, phone, True)
+
+                    # Base64 문자열 생성
+                    base64_str = manager.session_to_string(phone)
+                    if base64_str:
+                        self.print_colored(f"🔤 Base64: {base64_str[:50]}...", "cyan")
+
+                    return True
+
+            except Exception as e:
+                self.print_colored(f"❌ 시도 {attempt + 1} 실패: {e}", "red")
+                self.logger.log_error(str(e))
+
+        self.print_colored(f"❌ {phone} 세션 생성 실패 (최대 시도 횟수 초과)", "red")
+        self.logger.log_session_created(library, phone, False)
+        return False
+
+    def print_results(self):
+        """전체 결과 출력"""
+        print("\n" + "=" * 60)
+        self.print_colored("📊 전체 결과 요약", "magenta")
+        print("=" * 60)
+
+        success_count = sum(1 for r in self.results if r["success"])
+        total_count = len(self.results)
+        fail_count = total_count - success_count
+
+        # 성공률 계산
+        success_rate = (success_count / total_count * 100) if total_count > 0 else 0
+
+        # 요약 정보
+        self.print_colored(f"\n✅ 성공: {success_count}개", "green")
+        self.print_colored(f"❌ 실패: {fail_count}개", "red")
+        self.print_colored(f"📈 성공률: {success_rate:.1f}%", "cyan")
+
+        # 라이브러리별 통계
+        print("\n📚 라이브러리별 통계:")
+        lib_stats = {}
+        for result in self.results:
+            lib = result["library"]
+            if lib not in lib_stats:
+                lib_stats[lib] = {"success": 0, "fail": 0}
+            if result["success"]:
+                lib_stats[lib]["success"] += 1
+            else:
+                lib_stats[lib]["fail"] += 1
+
+        for lib, stats in lib_stats.items():
+            total = stats["success"] + stats["fail"]
+            print(f"  • {lib}: {stats['success']}/{total} 성공")
+
+        # 상세 결과
+        print("\n📋 상세 결과:")
+        print("-" * 60)
+        print(f"{'상태':^6} | {'라이브러리':^15} | {'전화번호':^20}")
+        print("-" * 60)
+
+        for result in self.results:
+            status = "✅" if result["success"] else "❌"
+            color = "green" if result["success"] else "red"
+            self.print_colored(
+                f"{status:^6} | {result['library']:^15} | {result['phone']:^20}", color
+            )
+        print("-" * 60)
+
+    async def run(self):
+        """메인 실행 함수"""
+        self.print_colored("🚀 텔레그램 멀티 세션 관리자 v1.0", "magenta")
+        print("=" * 60)
+
+        try:
+            # 1. API 선택/등록
+            api_config = self.select_or_register_api()
+
+            # 2. 라이브러리 선택
+            libraries = self.select_libraries()
+            if not libraries:
+                self.print_colored("⚠️  라이브러리를 선택하지 않았습니다.", "yellow")
+                return
+
+            # 3. 전화번호 입력
+            phones = self.input_phone_numbers()
+            if not phones:
+                self.print_colored("⚠️  전화번호를 입력하지 않았습니다.", "yellow")
+                return
+
+            # 4. 세션 생성
+            await self.create_sessions(api_config, libraries, phones)
+
+            # 5. 결과 출력
+            self.print_results()
+
+        except KeyboardInterrupt:
+            self.print_colored("\n\n⚠️  사용자에 의해 중단되었습니다.", "yellow")
+            self.logger.log_error("사용자 중단")
+        except Exception as e:
+            self.print_colored(f"\n❌ 오류 발생: {e}", "red")
+            self.logger.log_error(str(e))
+
+        self.print_colored("\n👋 프로그램을 종료합니다.", "cyan")
+
+
+if __name__ == "__main__":
+    # Windows 환경에서 컬러 출력 활성화
+    if sys.platform.startswith("win"):
+        os.system("color")
+
+    manager = TelegramSessionManager()
+    asyncio.run(manager.run())
+
+
+
+=====================================
+File: ./src/tg_session_manager/cli/main_fixed.py
+=====================================
+# main.py의 문제가 되는 부분만 수정
+# _create_single_session 메서드 내부의 코드 수정
+
+async def _create_single_session(self, api_config: Dict[str, str], 
+                               library: str, phone: str) -> bool:
+    """단일 세션 생성"""
+    manager = SessionFactory.create_session_manager(
+        library, api_config['api_id'], api_config['api_hash']
+    )
+    
+    if not manager:
+        self.print_colored(f"❌ {library} 매니저 생성 실패", "red")
+        return False
+    
+    # 기존 세션 확인 및 백업
+    session_name = extract_session_name(phone)
+    session_path = os.path.join(SESSION_DIRS[library], f"{session_name}.session")
+    
+    if os.path.exists(session_path):
+        self.print_colored(f"⚠️  기존 세션 발견: {session_name}", "yellow")
+        backup_path = backup_existing_session(session_path)
+        if backup_path:
+            self.print_colored(f"💾 백업 완료: {os.path.basename(backup_path)}", "green")
+            self.logger.log_backup(session_path, backup_path)
+    
+    print(f"\n🔄 [{library}] {phone} 세션 생성 중...")
+    
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        try:
+            # 클로저 문제 해결을 위해 기본값 인자 사용
+            def make_code_callback(attempt_num=attempt):
+                def code_callback():
+                    code = input(f"📲 인증 코드 입력 ({attempt_num + 1}/{MAX_RETRY_ATTEMPTS}): ")
+                    self.logger.log_authentication(phone, attempt_num + 1, bool(code))
+                    return code
+                return code_callback
+            
+            def make_password_callback(attempt_num=attempt):
+                def password_callback():
+                    return input(f"🔐 2FA 비밀번호 입력 ({attempt_num + 1}/{MAX_RETRY_ATTEMPTS}): ")
+                return password_callback
+            
+            success = await manager.create_session(
+                phone, make_code_callback(), make_password_callback()
+            )
+            
+            if success:
+                self.print_colored("✅ 세션 생성 성공!", "green")
+                self.logger.log_session_created(library, phone, True)
+                
+                # Base64 문자열 생성
+                base64_str = manager.session_to_string(phone)
+                if base64_str:
+                    self.print_colored(f"🔤 Base64: {base64_str[:50]}...", "cyan")
+                
+                return True
+                
+        except (IOError, OSError, RuntimeError) as e:
+            self.print_colored(f"❌ 시도 {attempt + 1} 실패: {e}", "red")
+            self.logger.log_error(str(e))
+    
+    self.print_colored(f"❌ {phone} 세션 생성 실패 (최대 시도 횟수 초과)", "red")
+    self.logger.log_session_created(library, phone, False)
+    return False
+
+
+
+=====================================
+File: ./src/tg_session_manager/config/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/config/config.py
+=====================================
+"""
+환경 설정 및 상수 관리 모듈
+"""
+
+import os
+from typing import Dict
+
+# 기본 경로 설정
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+API_CONFIG_FILE = os.path.join(BASE_DIR, "api_configs.json")
+
+# 라이브러리별 세션 디렉토리
+SESSION_DIRS: Dict[str, str] = {
+    "telethon": os.path.join(SESSIONS_DIR, "telethon"),
+    "pyrogram": os.path.join(SESSIONS_DIR, "pyrogram"),
+    "telegram-bot": os.path.join(SESSIONS_DIR, "telegram-bot"),
+    "tdlib": os.path.join(SESSIONS_DIR, "tdlib"),
+}
+
+# 기본 설정값
+MAX_RETRY_ATTEMPTS = 3
+DEFAULT_TIMEOUT = 60
+
+# 디렉토리 생성
+for dir_path in SESSION_DIRS.values():
+    os.makedirs(dir_path, exist_ok=True)
+
+
+
+=====================================
+File: ./src/tg_session_manager/core/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/core/api_manager.py
+=====================================
+"""
+API 정보 관리 모듈 - api_id/api_hash 등록, 조회, 저장
+"""
+
+import json
+import os
+from typing import Dict, List, Optional
+
+from config.config import API_CONFIG_FILE
+
+
+class APIManager:
+    """텔레그램 API 정보를 관리하는 클래스"""
+
+    def __init__(self):
+        self.api_configs: Dict[str, Dict[str, str]] = self._load_configs()
+
+    def _load_configs(self) -> Dict[str, Dict[str, str]]:
+        """JSON 파일에서 API 설정 로드"""
+        if os.path.exists(API_CONFIG_FILE):
+            try:
+                with open(API_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"API 설정 로드 실패: {e}")
+        return {}
+
+    def save_configs(self) -> None:
+        """API 설정을 JSON 파일에 저장"""
+        try:
+            with open(API_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.api_configs, f, indent=2)
+        except IOError as e:
+            print(f"API 설정 저장 실패: {e}")
+
+    def register_api(self, name: str, api_id: str, api_hash: str) -> bool:
+        """새로운 API 정보 등록"""
+        self.api_configs[name] = {"api_id": api_id, "api_hash": api_hash}
+        self.save_configs()
+        return True
+
+    def get_api(self, name: str) -> Optional[Dict[str, str]]:
+        """등록된 API 정보 조회"""
+        return self.api_configs.get(name)
+
+    def list_apis(self) -> List[str]:
+        """등록된 모든 API 이름 반환"""
+        return list(self.api_configs.keys())
+
+
+
+=====================================
+File: ./src/tg_session_manager/core/session_base.py
+=====================================
+"""
+세션 관리 추상 클래스 - 라이브러리별 인터페이스 정의
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, Optional
+
+
+class SessionBase(ABC):
+    """세션 관리를 위한 추상 기반 클래스"""
+
+    def __init__(self, api_id: str, api_hash: str, session_dir: str):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_dir = session_dir
+
+    @abstractmethod
+    async def create_session(
+        self, phone_number: str, code_callback=None, password_callback=None
+    ) -> bool:
+        """세션 생성 - 구현 필수"""
+
+    @abstractmethod
+    def session_to_string(self, phone_number: str) -> Optional[str]:
+        """세션을 base64 문자열로 변환"""
+
+    @abstractmethod
+    def validate_session(self, phone_number: str) -> bool:
+        """세션 유효성 검사"""
+
+    @abstractmethod
+    def get_session_info(self, phone_number: str) -> Optional[Dict]:
+        """세션 정보 조회"""
+
+
+
+=====================================
+File: ./src/tg_session_manager/core/session_factory.py
+=====================================
+"""
+세션 팩토리 - 라이브러리명에 따라 적절한 세션 매니저 인스턴스 생성
+"""
+
+from typing import Optional
+
+from config.config import SESSION_DIRS
+from lib.pyrogram_session import PyrogramSession
+from core.session_base import SessionBase
+from lib.tdlib_session import TDLibSession
+from lib.telegram_bot_session import TelegramBotSession
+from lib.telethon_session import TelethonSession
+
+
+class SessionFactory:
+    """세션 매니저 팩토리 클래스"""
+
+    @staticmethod
+    def create_session_manager(
+        library: str, api_id: str, api_hash: str
+    ) -> Optional[SessionBase]:
+        """라이브러리명에 따라 세션 매니저 인스턴스 생성"""
+        library = library.lower()
+
+        if library not in SESSION_DIRS:
+            print(f"지원하지 않는 라이브러리: {library}")
+            return None
+
+        session_dir = SESSION_DIRS[library]
+
+        if library == "telethon":
+            return TelethonSession(api_id, api_hash, session_dir)
+        elif library == "pyrogram":
+            return PyrogramSession(api_id, api_hash, session_dir)
+        elif library == "telegram-bot":
+            return TelegramBotSession(api_id, api_hash, session_dir)
+        elif library == "tdlib":
+            return TDLibSession(api_id, api_hash, session_dir)
+
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/dialogs/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/dialogs/auth_dialog.py
+=====================================
+"""
+인증 정보 입력 다이얼로그
+"""
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QDialogButtonBox,
+    QMessageBox
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+from typing import Optional, Dict
+
+
+class AuthDialog(QDialog):
+    """인증 정보 입력 다이얼로그"""
+
+    def __init__(self, parent, library: str, phone: str):
+        super().__init__(parent)
+        self.library = library
+        self.phone = phone
+        self.auth_data = None
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI 구성"""
+        self.setWindowTitle(f"인증 - {self.library}")
+        self.setModal(True)
+        self.setFixedSize(450, 250)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # 헤더
+        header_layout = QVBoxLayout()
+
+        title_label = QLabel(f"{self.library} 인증")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(title_label)
+
+        phone_label = QLabel(f"전화번호: {self.phone}")
+        phone_label.setAlignment(Qt.AlignCenter)
+        phone_label.setStyleSheet("color: #0d7377;")
+        header_layout.addWidget(phone_label)
+
+        layout.addLayout(header_layout)
+
+        # 구분선
+        line = QLabel()
+        line.setFrameStyle(QLabel.HLine | QLabel.Sunken)
+        layout.addWidget(line)
+
+        # 인증 코드 입력
+        code_layout = QHBoxLayout()
+        code_layout.addWidget(QLabel("인증 코드:"))
+
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("텔레그램에서 받은 코드 입력")
+        self.code_input.setMaxLength(10)
+        code_layout.addWidget(self.code_input)
+
+        layout.addLayout(code_layout)
+
+        # 2FA 비밀번호 입력
+        password_layout = QHBoxLayout()
+        password_layout.addWidget(QLabel("2FA 비밀번호:"))
+
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setPlaceholderText("선택사항 - 2단계 인증 설정한 경우")
+        password_layout.addWidget(self.password_input)
+
+        layout.addLayout(password_layout)
+
+        # 버튼
+        button_box = QDialogButtonBox()
+
+        ok_button = button_box.addButton("확인", QDialogButtonBox.AcceptRole)
+        skip_button = button_box.addButton("건너뛰기", QDialogButtonBox.RejectRole)
+
+        ok_button.clicked.connect(self.on_ok_clicked)
+        skip_button.clicked.connect(self.reject)
+
+        layout.addWidget(button_box)
+
+        # 포커스 설정
+        self.code_input.setFocus()
+
+        # Enter 키 바인딩
+        self.code_input.returnPressed.connect(self.on_ok_clicked)
+        self.password_input.returnPressed.connect(self.on_ok_clicked)
+
+    def on_ok_clicked(self):
+        """확인 버튼 클릭"""
+        code = self.code_input.text().strip()
+
+        if not code:
+            QMessageBox.warning(
+                self,
+                "경고",
+                "인증 코드를 입력하세요."
+            )
+            self.code_input.setFocus()
+            return
+
+        self.auth_data = {
+            'code': code,
+            'password': self.password_input.text().strip() or None
+        }
+
+        self.accept()
+
+    def get_auth_data(self) -> Optional[Dict[str, str]]:
+        """인증 데이터 반환"""
+        return self.auth_data
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/dialogs/session_detail_dialog.py
+=====================================
+"""
+세션 문자열 상세 보기 다이얼로그
+"""
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QClipboard, QFont
+from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,
+                             QMessageBox, QPushButton, QTextEdit, QVBoxLayout)
+
+
+class SessionDetailDialog(QDialog):
+    """세션 상세 정보 다이얼로그"""
+
+    def __init__(self, parent, phone: str, library: str, session_string: str):
+        super().__init__(parent)
+        self.phone = phone
+        self.library = library
+        self.session_string = session_string
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI 구성"""
+        self.setWindowTitle(f"세션 문자열 - {self.phone}")
+        self.setModal(True)
+        self.resize(700, 500)
+
+        layout = QVBoxLayout(self)
+
+        # 헤더
+        header_layout = QVBoxLayout()
+
+        title_label = QLabel(f"{self.library} 세션")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        title_label.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(title_label)
+
+        phone_label = QLabel(f"전화번호: {self.phone}")
+        phone_label.setAlignment(Qt.AlignCenter)
+        phone_label.setStyleSheet("color: #0d7377;")
+        header_layout.addWidget(phone_label)
+
+        layout.addLayout(header_layout)
+
+        # 구분선
+        line = QLabel()
+        line.setFrameStyle(QLabel.HLine | QLabel.Sunken)
+        layout.addWidget(line)
+
+        # 정보 레이블
+        info_label = QLabel(
+            "아래 문자열은 세션 파일의 Base64 인코딩입니다.\n"
+            "이 문자열을 안전하게 보관하고 필요할 때 복원할 수 있습니다."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #888888; padding: 10px;")
+        layout.addWidget(info_label)
+
+        # 세션 문자열 표시
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlainText(self.session_string)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.text_edit)
+
+        # 통계 정보
+        stats_label = QLabel(f"문자열 길이: {len(self.session_string):,} 문자")
+        stats_label.setStyleSheet("color: #666666;")
+        layout.addWidget(stats_label)
+
+        # 버튼 레이아웃
+        button_layout = QHBoxLayout()
+
+        copy_btn = QPushButton("클립보드에 복사")
+        copy_btn.clicked.connect(self.copy_to_clipboard)
+        button_layout.addWidget(copy_btn)
+
+        select_all_btn = QPushButton("전체 선택")
+        select_all_btn.clicked.connect(self.text_edit.selectAll)
+        button_layout.addWidget(select_all_btn)
+
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(close_btn)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def copy_to_clipboard(self):
+        """클립보드에 복사"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.session_string)
+
+        QMessageBox.information(
+            self,
+            "복사 완료",
+            "세션 문자열이 클립보드에 복사되었습니다."
+        )
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/qt_main.py
+=====================================
+#!/usr/bin/env python3
+"""
+텔레그램 세션 관리자 PyQt5 GUI - 다크 블루 테마
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gui.qt_main_window import MainWindow
+from gui.themes.dark_theme import apply_dark_theme
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import QApplication
+
+
+def main():
+    """메인 함수"""
+    # 고해상도 디스플레이 지원
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    # 애플리케이션 생성
+    app = QApplication(sys.argv)
+    app.setApplicationName("Telegram Session Manager")
+    app.setOrganizationName("TelegramTools")
+
+    # 폰트 설정 (선택사항)
+    font = QFont("Segoe UI", 10)
+    app.setFont(font)
+
+    # 다크 테마 적용
+    apply_dark_theme(app)
+
+    # 메인 윈도우 생성 및 표시
+    window = MainWindow()
+    window.setWindowTitle("텔레그램 세션 관리자 - Dark Blue Theme")
+    window.show()
+
+    # 이벤트 루프 실행
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        input("Enter를 눌러 종료...")
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/qt_main_window.py
+=====================================
+"""
+PyQt5 메인 윈도우
+"""
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QStatusBar, QMessageBox, QFileDialog
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QThread
+from PyQt5.QtGui import QPalette, QColor
+import json
+from datetime import datetime
+from typing import Dict, List
+
+from gui.widgets.api_frame import APIFrame
+from gui.widgets.input_frame import InputFrame
+from gui.widgets.result_frame import ResultFrame
+from gui.workers.session_worker import SessionWorker
+from core.api_manager import APIManager
+from utils.logger import SessionLogger
+
+
+class MainWindow(QMainWindow):
+    """메인 윈도우 클래스"""
+
+    # 시그널 정의
+    session_created = pyqtSignal(dict)
+    log_message = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("텔레그램 세션 관리자 v2.0")
+        self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(1000, 600)
+
+        # 변수 초기화
+        self.api_manager = APIManager()
+        self.logger = SessionLogger()
+        self.current_api = None
+        self.session_strings = {}  # {phone: {library: base64_string}}
+        self.worker = None
+        self.worker_thread = None
+
+        # UI 설정
+        self.setup_ui()
+
+        # 시그널 연결
+        self.connect_signals()
+
+        # 상태 표시줄 초기화
+        self.status_bar.showMessage("준비됨")
+
+    def setup_ui(self):
+        """UI 구성"""
+        # 중앙 위젯
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        # 메인 레이아웃
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # API 프레임
+        self.api_frame = APIFrame(self.api_manager)
+        main_layout.addWidget(self.api_frame)
+
+        # 입력 프레임
+        self.input_frame = InputFrame()
+        main_layout.addWidget(self.input_frame)
+
+        # 결과 프레임
+        self.result_frame = ResultFrame()
+        main_layout.addWidget(self.result_frame)
+
+        # 상태 표시줄
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def connect_signals(self):
+        """시그널 연결"""
+        # API 프레임 시그널
+        self.api_frame.api_selected.connect(self.on_api_selected)
+        self.api_frame.api_registered.connect(self.on_api_registered)
+
+        # 입력 프레임 시그널
+        self.input_frame.start_processing.connect(self.start_session_creation)
+        self.input_frame.stop_processing.connect(self.stop_session_creation)
+
+        # 결과 프레임 시그널
+        self.result_frame.copy_requested.connect(self.copy_session_string)
+        self.result_frame.export_requested.connect(self.export_all_sessions)
+        self.result_frame.clear_requested.connect(self.clear_results)
+        self.result_frame.session_double_clicked.connect(self.show_session_details)
+
+        # 내부 시그널
+        self.session_created.connect(self.on_session_created)
+        self.log_message.connect(self.add_log)
+
+    def on_api_selected(self, api_config: Dict):
+        """API 선택 이벤트"""
+        self.current_api = api_config
+        self.add_log(f"API 선택됨: {api_config.get('name', 'Unknown')}")
+
+    def on_api_registered(self, api_name: str):
+        """API 등록 이벤트"""
+        self.logger.log_api_registered(api_name)
+        self.add_log(f"새 API 등록됨: {api_name}")
+
+    def start_session_creation(self, data: Dict):
+        """세션 생성 시작"""
+        if not self.current_api:
+            QMessageBox.warning(self, "경고", "먼저 API를 선택하세요.")
+            return
+
+        libraries = data['libraries']
+        phones = data['phones']
+
+        if not libraries:
+            QMessageBox.warning(self, "경고", "최소 하나의 라이브러리를 선택하세요.")
+            return
+
+        if not phones:
+            QMessageBox.warning(self, "경고", "전화번호를 입력하세요.")
+            return
+
+        # 진행 상태 초기화
+        total_tasks = len(libraries) * len(phones)
+        self.input_frame.set_progress_max(total_tasks)
+        self.input_frame.set_progress_value(0)
+        self.input_frame.set_processing(True)
+
+        # 워커 스레드 생성
+        self.worker_thread = QThread()
+        self.worker = SessionWorker(
+            self.current_api,
+            libraries,
+            phones
+        )
+
+        self.worker.moveToThread(self.worker_thread)
+
+        # 시그널 연결
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.session_created.connect(self.session_created.emit)
+        self.worker.log_message.connect(self.log_message.emit)
+        self.worker.auth_required.connect(self.handle_auth_required)
+        self.worker.finished.connect(self.on_processing_finished)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+
+        # 스레드 시작
+        self.worker_thread.start()
+
+        self.status_bar.showMessage(f"세션 생성 중... (총 {total_tasks}개)")
+        self.add_log(f"세션 생성 시작: {total_tasks}개 작업")
+
+    def stop_session_creation(self):
+        """세션 생성 중지"""
+        if self.worker:
+            self.worker.stop()
+            self.add_log("사용자에 의해 중지 요청됨")
+
+    def handle_auth_required(self, data: Dict):
+        """인증 요청 처리"""
+        from gui.dialogs.auth_dialog import AuthDialog
+
+        dialog = AuthDialog(
+            self,
+            data['library'],
+            data['phone']
+        )
+
+        if dialog.exec_():
+            auth_data = dialog.get_auth_data()
+            if self.worker:
+                self.worker.provide_auth(auth_data)
+        else:
+            if self.worker:
+                self.worker.provide_auth(None)
+
+    def update_progress(self, value: int):
+        """진행 상황 업데이트"""
+        self.input_frame.set_progress_value(value)
+
+    def on_session_created(self, result: Dict):
+        """세션 생성 완료 이벤트"""
+        phone = result['phone']
+        library = result['library']
+
+        if result['success']:
+            # 메모리에 저장
+            if phone not in self.session_strings:
+                self.session_strings[phone] = {}
+            self.session_strings[phone][library] = result['session_string']
+
+            # UI에 추가
+            self.result_frame.add_result({
+                'phone': phone,
+                'library': library,
+                'status': '성공',
+                'string_preview': result['session_string'][:50] + '...'
+            })
+
+            self.logger.log_session_created(library, phone, True)
+        else:
+            self.result_frame.add_result({
+                'phone': phone,
+                'library': library,
+                'status': '실패',
+                'string_preview': result.get('error', '알 수 없는 오류')
+            })
+
+            self.logger.log_session_created(library, phone, False)
+
+    def on_processing_finished(self):
+        """처리 완료"""
+        self.input_frame.set_processing(False)
+        self.status_bar.showMessage("세션 생성 완료")
+        self.add_log("모든 작업 완료")
+
+        # 결과 요약
+        total = len(self.result_frame.get_all_results())
+        success = len([r for r in self.result_frame.get_all_results()
+                      if r['status'] == '성공'])
+        self.add_log(f"결과: 성공 {success}/{total}")
+
+    def copy_session_string(self, phone: str, library: str):
+        """세션 문자열 복사"""
+        if phone in self.session_strings and library in self.session_strings[phone]:
+            from PyQt5.QtWidgets import QApplication
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.session_strings[phone][library])
+
+            self.status_bar.showMessage("클립보드에 복사됨", 3000)
+            self.add_log(f"세션 문자열 복사됨: {phone} - {library}")
+
+    def show_session_details(self, phone: str, library: str):
+        """세션 상세 정보 표시"""
+        if phone in self.session_strings and library in self.session_strings[phone]:
+            from gui.dialogs.session_detail_dialog import SessionDetailDialog
+
+            dialog = SessionDetailDialog(
+                self,
+                phone,
+                library,
+                self.session_strings[phone][library]
+            )
+            dialog.exec_()
+
+    def export_all_sessions(self):
+        """모든 세션 내보내기"""
+        if not self.session_strings:
+            QMessageBox.warning(self, "경고", "내보낼 세션이 없습니다.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "세션 내보내기",
+            f"sessions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+
+        if filename:
+            try:
+                export_data = {
+                    'exported_at': datetime.now().isoformat(),
+                    'version': '2.0',
+                    'sessions': self.session_strings
+                }
+
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+                QMessageBox.information(
+                    self,
+                    "성공",
+                    f"세션이 저장되었습니다:\n{filename}"
+                )
+                self.add_log(f"세션 내보내기 완료: {filename}")
+
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "오류",
+                    f"저장 실패: {str(e)}"
+                )
+
+    def clear_results(self):
+        """결과 초기화"""
+        self.session_strings.clear()
+        self.add_log("결과 목록 초기화됨")
+
+    def add_log(self, message: str):
+        """로그 추가"""
+        self.result_frame.add_log(message)
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/run_qt_gui.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/themes/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/themes/dark_theme.py
+=====================================
+"""
+눈이 편안한 다크 블루 테마
+"""
+
+DARK_BLUE_THEME = """
+/* 전체 배경 및 기본 색상 */
+QWidget {
+    background-color: #0a0e1a;
+    color: #e0e6f0;
+    font-family: 'Segoe UI', 'Noto Sans', Arial, sans-serif;
+    font-size: 13px;
+}
+
+QMainWindow {
+    background-color: #0a0e1a;
+}
+
+QGroupBox {
+    background-color: #0f1420;
+    border: 2px solid #1e2940;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 10px 0 10px;
+    color: #4a9eff;
+}
+
+QPushButton {
+    background-color: #1a3a52;
+    color: #ffffff;
+    border: 1px solid #2a5a7a;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-weight: 500;
+    min-height: 28px;
+}
+
+QPushButton:hover {
+    background-color: #245580;
+    border: 1px solid #3a7aa0;
+}
+
+QPushButton:pressed {
+    background-color: #163045;
+    border: 1px solid #2a5a7a;
+}
+
+QPushButton:disabled {
+    background-color: #151d2a;
+    color: #4a5568;
+    border: 1px solid #1a2332;
+}
+
+QPushButton#startButton {
+    background-color: #2563eb;
+    font-weight: bold;
+}
+
+QPushButton#startButton:hover {
+    background-color: #3b82f6;
+}
+
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: #0d1117;
+    color: #e0e6f0;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+    padding: 6px;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #3b82f6;
+    background-color: #0f1420;
+}
+
+QComboBox {
+    background-color: #0d1117;
+    color: #e0e6f0;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+    padding: 6px;
+    min-height: 28px;
+}
+
+QComboBox:hover {
+    border: 1px solid #3b82f6;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+QComboBox::down-arrow {
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 5px solid #4a9eff;
+    margin-right: 5px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #0d1117;
+    color: #e0e6f0;
+    selection-background-color: #2563eb;
+    border: 1px solid #1e2940;
+}
+
+QCheckBox {
+    spacing: 8px;
+    color: #e0e6f0;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    border: 2px solid #1e2940;
+    background-color: #0d1117;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #2563eb;
+    border: 2px solid #3b82f6;
+}
+
+QCheckBox::indicator:hover {
+    border: 2px solid #3b82f6;
+}
+
+QTreeWidget {
+    background-color: #0d1117;
+    color: #e0e6f0;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+    outline: none;
+}
+
+QTreeWidget::item {
+    padding: 4px;
+    border-radius: 4px;
+}
+
+QTreeWidget::item:hover {
+    background-color: #1a2332;
+}
+
+QTreeWidget::item:selected {
+    background-color: #2563eb;
+    color: #ffffff;
+}
+
+QHeaderView::section {
+    background-color: #0f1420;
+    color: #4a9eff;
+    border: none;
+    border-bottom: 2px solid #1e2940;
+    padding: 6px;
+    font-weight: bold;
+}
+
+QTabWidget::pane {
+    background-color: #0f1420;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+}
+
+QTabBar::tab {
+    background-color: #0a0e1a;
+    color: #8b92a0;
+    padding: 8px 16px;
+    margin-right: 2px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background-color: #0f1420;
+    color: #4a9eff;
+    border-bottom: 2px solid #2563eb;
+}
+
+QTabBar::tab:hover {
+    background-color: #1a2332;
+    color: #e0e6f0;
+}
+
+QProgressBar {
+    background-color: #0d1117;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+    text-align: center;
+    color: #ffffff;
+    height: 24px;
+}
+
+QProgressBar::chunk {
+    background-color: #2563eb;
+    border-radius: 3px;
+}
+
+QScrollBar:vertical {
+    background-color: #0a0e1a;
+    width: 12px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #1e2940;
+    border-radius: 6px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #2a3a50;
+}
+
+QScrollBar:horizontal {
+    background-color: #0a0e1a;
+    height: 12px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #1e2940;
+    border-radius: 6px;
+    min-width: 30px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #2a3a50;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    border: none;
+    background: none;
+}
+
+QStatusBar {
+    background-color: #0a0e1a;
+    color: #8b92a0;
+    border-top: 1px solid #1e2940;
+}
+
+QMenu {
+    background-color: #0d1117;
+    color: #e0e6f0;
+    border: 1px solid #1e2940;
+    border-radius: 4px;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 20px;
+    border-radius: 4px;
+}
+
+QMenu::item:selected {
+    background-color: #2563eb;
+    color: #ffffff;
+}
+
+QToolTip {
+    background-color: #1a2332;
+    color: #e0e6f0;
+    border: 1px solid #2a3a50;
+    border-radius: 4px;
+    padding: 4px;
+}
+
+QLabel {
+    color: #e0e6f0;
+}
+
+QLabel#infoLabel {
+    color: #4a9eff;
+    font-weight: 500;
+}
+
+QLabel#errorLabel {
+    color: #f87171;
+}
+
+QLabel#successLabel {
+    color: #34d399;
+}
+
+QDialog {
+    background-color: #0a0e1a;
+}
+
+QDialogButtonBox QPushButton {
+    min-width: 80px;
+}
+
+QMessageBox {
+    background-color: #0a0e1a;
+}
+
+QMessageBox QLabel {
+    color: #e0e6f0;
+}
+
+QSplitter::handle {
+    background-color: #1e2940;
+}
+
+QSplitter::handle:hover {
+    background-color: #2a3a50;
+}
+"""
+
+def apply_dark_theme(app):
+    """애플리케이션에 다크 테마 적용"""
+    app.setStyleSheet(DARK_BLUE_THEME)
+
+    # 추가 팔레트 설정
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QColor, QPalette
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(10, 14, 26))
+    palette.setColor(QPalette.WindowText, QColor(224, 230, 240))
+    palette.setColor(QPalette.Base, QColor(13, 17, 23))
+    palette.setColor(QPalette.AlternateBase, QColor(15, 20, 32))
+    palette.setColor(QPalette.ToolTipBase, QColor(26, 35, 50))
+    palette.setColor(QPalette.ToolTipText, QColor(224, 230, 240))
+    palette.setColor(QPalette.Text, QColor(224, 230, 240))
+    palette.setColor(QPalette.Button, QColor(26, 58, 82))
+    palette.setColor(QPalette.ButtonText, QColor(255, 255, 255))
+    palette.setColor(QPalette.BrightText, QColor(74, 158, 255))
+    palette.setColor(QPalette.Link, QColor(37, 99, 235))
+    palette.setColor(QPalette.Highlight, QColor(37, 99, 235))
+    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+
+    app.setPalette(palette)
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/widgets/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/widgets/api_frame.py
+=====================================
+"""
+API 선택 및 관리 프레임
+"""
+from typing import Dict, Optional
+
+from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QGridLayout,
+                             QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                             QMessageBox, QPushButton, QVBoxLayout)
+
+
+class APIFrame(QGroupBox):
+    """API 관리 프레임"""
+
+    # 시그널 정의
+    api_selected = pyqtSignal(dict)
+    api_registered = pyqtSignal(str)
+
+    def __init__(self, api_manager):
+        super().__init__("API 설정")
+        self.api_manager = api_manager
+        self.current_api = None
+
+        self.setup_ui()
+        self.refresh_api_list()
+
+    def setup_ui(self):
+        """UI 구성"""
+        layout = QHBoxLayout(self)
+
+        # API 선택 레이블
+        layout.addWidget(QLabel("API 선택:"))
+
+        # API 콤보박스
+        self.api_combo = QComboBox()
+        self.api_combo.setMinimumWidth(200)
+        self.api_combo.currentTextChanged.connect(self.on_api_changed)
+        layout.addWidget(self.api_combo)
+
+        # 새 API 등록 버튼
+        self.register_btn = QPushButton("새 API 등록")
+        self.register_btn.clicked.connect(self.show_register_dialog)
+        layout.addWidget(self.register_btn)
+
+        # API 정보 레이블
+        self.info_label = QLabel("API를 선택하세요")
+        self.info_label.setStyleSheet("color: #ff9800;")
+        layout.addWidget(self.info_label)
+
+        # 여백 추가
+        layout.addStretch()
+
+    def refresh_api_list(self):
+        """API 목록 새로고침"""
+        self.api_combo.clear()
+        apis = self.api_manager.list_apis()
+
+        if apis:
+            self.api_combo.addItems(apis)
+            self.api_combo.setCurrentIndex(0)
+            self.on_api_changed(apis[0])
+        else:
+            self.info_label.setText("등록된 API가 없습니다")
+            self.info_label.setStyleSheet("color: #f44336;")
+
+    def on_api_changed(self, api_name: str):
+        """API 선택 변경"""
+        if api_name:
+            api_config = self.api_manager.get_api(api_name)
+            if api_config:
+                self.current_api = api_config
+                self.current_api['name'] = api_name
+                self.info_label.setText(f"✓ {api_name}")
+                self.info_label.setStyleSheet("color: #4CAF50;")
+                self.api_selected.emit(self.current_api)
+
+    def show_register_dialog(self):
+        """API 등록 다이얼로그 표시"""
+        dialog = APIRegisterDialog(self)
+        if dialog.exec_():
+            api_data = dialog.get_api_data()
+            if api_data:
+                self.api_manager.register_api(
+                    api_data['name'],
+                    api_data['api_id'],
+                    api_data['api_hash']
+                )
+                self.api_registered.emit(api_data['name'])
+                self.refresh_api_list()
+                self.api_combo.setCurrentText(api_data['name'])
+
+                QMessageBox.information(
+                    self,
+                    "성공",
+                    f"API '{api_data['name']}' 등록 완료!"
+                )
+
+
+class APIRegisterDialog(QDialog):
+    """API 등록 다이얼로그"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("새 API 등록")
+        self.setModal(True)
+        self.setFixedSize(400, 200)
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI 구성"""
+        layout = QVBoxLayout(self)
+
+        # 입력 필드 그리드
+        grid_layout = QGridLayout()
+
+        # API 이름
+        grid_layout.addWidget(QLabel("API 이름:"), 0, 0)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("예: MyAPI")
+        grid_layout.addWidget(self.name_input, 0, 1)
+
+        # API ID
+        grid_layout.addWidget(QLabel("API ID:"), 1, 0)
+        self.api_id_input = QLineEdit()
+        self.api_id_input.setPlaceholderText("숫자만 입력")
+        grid_layout.addWidget(self.api_id_input, 1, 1)
+
+        # API Hash
+        grid_layout.addWidget(QLabel("API Hash:"), 2, 0)
+        self.api_hash_input = QLineEdit()
+        self.api_hash_input.setPlaceholderText("32자리 문자열")
+        grid_layout.addWidget(self.api_hash_input, 2, 1)
+
+        layout.addLayout(grid_layout)
+
+        # 버튼
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # 첫 번째 입력 필드에 포커스
+        self.name_input.setFocus()
+
+    def validate_and_accept(self):
+        """입력 검증 후 승인"""
+        name = self.name_input.text().strip()
+        api_id = self.api_id_input.text().strip()
+        api_hash = self.api_hash_input.text().strip()
+
+        # 검증
+        if not name:
+            QMessageBox.warning(self, "경고", "API 이름을 입력하세요.")
+            self.name_input.setFocus()
+            return
+
+        if not api_id:
+            QMessageBox.warning(self, "경고", "API ID를 입력하세요.")
+            self.api_id_input.setFocus()
+            return
+
+        if not api_id.isdigit():
+            QMessageBox.warning(self, "경고", "API ID는 숫자만 입력 가능합니다.")
+            self.api_id_input.setFocus()
+            return
+
+        if not api_hash:
+            QMessageBox.warning(self, "경고", "API Hash를 입력하세요.")
+            self.api_hash_input.setFocus()
+            return
+
+        if len(api_hash) != 32:
+            QMessageBox.warning(self, "경고", "API Hash는 32자리여야 합니다.")
+            self.api_hash_input.setFocus()
+            return
+
+        self.accept()
+
+    def get_api_data(self) -> Optional[Dict[str, str]]:
+        """입력된 API 데이터 반환"""
+        if self.result() == QDialog.Accepted:
+            return {
+                'name': self.name_input.text().strip(),
+                'api_id': self.api_id_input.text().strip(),
+                'api_hash': self.api_hash_input.text().strip()
+            }
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/widgets/input_frame.py
+=====================================
+"""
+라이브러리 선택 및 전화번호 입력 프레임
+"""
+import re
+from typing import Dict, List
+
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QTextCursor
+from PyQt5.QtWidgets import (QCheckBox, QGroupBox, QHBoxLayout, QLabel,
+                             QProgressBar, QPushButton, QTextEdit, QVBoxLayout)
+
+
+class InputFrame(QGroupBox):
+    """입력 프레임"""
+
+    # 시그널 정의
+    start_processing = pyqtSignal(dict)
+    stop_processing = pyqtSignal()
+
+    def __init__(self):
+        super().__init__("세션 생성")
+        self.processing = False
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI 구성"""
+        layout = QVBoxLayout(self)
+
+        # 라이브러리 선택
+        lib_layout = QHBoxLayout()
+        lib_layout.addWidget(QLabel("라이브러리 선택:"))
+
+        self.library_checkboxes = {}
+        libraries = [
+            ("Telethon", "telethon"),
+            ("Pyrogram", "pyrogram"),
+            ("TDLib", "tdlib"),
+            ("Bot API", "telegram-bot")
+        ]
+
+        for display_name, lib_name in libraries:
+            checkbox = QCheckBox(display_name)
+            checkbox.setChecked(lib_name in ['telethon', 'pyrogram'])
+            self.library_checkboxes[lib_name] = checkbox
+            lib_layout.addWidget(checkbox)
+
+        lib_layout.addStretch()
+        layout.addLayout(lib_layout)
+
+        # 전화번호 입력
+        phone_label = QLabel("전화번호 입력 (쉼표로 구분):")
+        layout.addWidget(phone_label)
+
+        self.phone_input = PhoneNumberTextEdit()
+        self.phone_input.setMaximumHeight(100)
+        self.phone_input.setPlaceholderText(
+            "예: +82 10 1234 5678, +8210-8765-4321\n"
+            "다양한 형식 지원: 공백, 하이픈 자동 제거"
+        )
+        layout.addWidget(self.phone_input)
+
+        # 버튼 레이아웃
+        button_layout = QHBoxLayout()
+
+        self.start_btn = QPushButton("세션 생성 시작")
+        self.start_btn.setObjectName("startButton")
+        self.start_btn.clicked.connect(self.on_start_clicked)
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        button_layout.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("중지")
+        self.stop_btn.clicked.connect(self.on_stop_clicked)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setCursor(Qt.PointingHandCursor)
+        button_layout.addWidget(self.stop_btn)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        # 진행 표시줄
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+    def on_start_clicked(self):
+        """시작 버튼 클릭"""
+        # 선택된 라이브러리 확인
+        selected_libraries = [
+            lib_name for lib_name, checkbox in self.library_checkboxes.items()
+            if checkbox.isChecked()
+        ]
+
+        # 전화번호 파싱
+        phones = self.phone_input.get_phone_numbers()
+
+        # 데이터 전송
+        self.start_processing.emit({
+            'libraries': selected_libraries,
+            'phones': phones
+        })
+
+    def on_stop_clicked(self):
+        """중지 버튼 클릭"""
+        self.stop_processing.emit()
+
+    def set_processing(self, processing: bool):
+        """처리 상태 설정"""
+        self.processing = processing
+        self.start_btn.setEnabled(not processing)
+        self.stop_btn.setEnabled(processing)
+
+        # 체크박스 활성화/비활성화
+        for checkbox in self.library_checkboxes.values():
+            checkbox.setEnabled(not processing)
+
+        # 전화번호 입력 활성화/비활성화
+        self.phone_input.setReadOnly(processing)
+
+    def set_progress_max(self, value: int):
+        """진행 표시줄 최대값 설정"""
+        self.progress_bar.setMaximum(value)
+
+    def set_progress_value(self, value: int):
+        """진행 표시줄 값 설정"""
+        self.progress_bar.setValue(value)
+        if self.progress_bar.maximum() > 0:
+            percentage = (value / self.progress_bar.maximum()) * 100
+            self.progress_bar.setFormat(f"{value}/{self.progress_bar.maximum()} ({percentage:.1f}%)")
+
+
+class PhoneNumberTextEdit(QTextEdit):
+    """전화번호 입력 위젯 - 자동 포맷팅 지원"""
+
+    def __init__(self):
+        super().__init__()
+        self.textChanged.connect(self.format_phone_numbers)
+        self.last_text = ""
+
+    def format_phone_numbers(self):
+        """입력 중 전화번호 포맷팅"""
+        current_text = self.toPlainText()
+
+        # 변경이 없으면 무시
+        if current_text == self.last_text:
+            return
+
+        # 커서 위치 저장
+        cursor = self.textCursor()
+        cursor_pos = cursor.position()
+
+        # 현재 줄 찾기
+        cursor.movePosition(QTextCursor.StartOfLine)
+        line_start = cursor.position()
+        cursor.movePosition(QTextCursor.EndOfLine)
+        line_end = cursor.position()
+
+        # 포맷팅 적용하지 않을 경우
+        if cursor_pos < line_end:
+            self.last_text = current_text
+            return
+
+        self.last_text = current_text
+
+    def get_phone_numbers(self) -> List[str]:
+        """전화번호 목록 반환 (포맷팅 적용)"""
+        text = self.toPlainText()
+
+        # 쉼표로 분리
+        raw_numbers = text.split(',')
+
+        # 각 번호 정리
+        cleaned_numbers = []
+        for number in raw_numbers:
+            cleaned = self.clean_phone_number(number.strip())
+            if cleaned:
+                cleaned_numbers.append(cleaned)
+
+        return cleaned_numbers
+
+    def clean_phone_number(self, phone: str) -> str:
+        """전화번호 정리 - 공백, 하이픈 등 제거"""
+        if not phone:
+            return ""
+
+        # 숫자와 + 기호만 남기기
+        cleaned = re.sub(r'[^\d+]', '', phone)
+
+        # + 기호가 맨 앞에만 있도록 확인
+        if '+' in cleaned[1:]:
+            cleaned = '+' + cleaned.replace('+', '')
+
+        # 최소 길이 확인 (국가 코드 + 최소 번호)
+        if len(cleaned) < 8:
+            return ""
+
+        return cleaneddmd
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/widgets/result_frame.py
+=====================================
+"""
+결과 표시 프레임 - 트리뷰와 로그
+"""
+from datetime import datetime
+from typing import Dict, List
+
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (QGroupBox, QHBoxLayout, QHeaderView, QMenu,
+                             QPushButton, QTabWidget, QTextEdit, QTreeWidget,
+                             QTreeWidgetItem, QVBoxLayout)
+
+
+class ResultFrame(QGroupBox):
+    """결과 표시 프레임"""
+
+    # 시그널 정의
+    copy_requested = pyqtSignal(str, str)  # phone, library
+    export_requested = pyqtSignal()
+    clear_requested = pyqtSignal()
+    session_double_clicked = pyqtSignal(str, str)  # phone, library
+
+    def __init__(self):
+        super().__init__("세션 문자열 결과")
+        self.results = []
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI 구성"""
+        layout = QVBoxLayout(self)
+
+        # 탭 위젯
+        self.tab_widget = QTabWidget()
+        layout.addWidget(self.tab_widget)
+
+        # 결과 탭
+        self.result_tree = QTreeWidget()
+        self.setup_result_tree()
+        self.tab_widget.addTab(self.result_tree, "생성된 세션")
+
+        # 로그 탭
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.tab_widget.addTab(self.log_text, "로그")
+
+        # 버튼 레이아웃
+        button_layout = QHBoxLayout()
+
+        copy_btn = QPushButton("선택 항목 복사")
+        copy_btn.clicked.connect(self.copy_selected)
+        button_layout.addWidget(copy_btn)
+
+        export_btn = QPushButton("모두 내보내기")
+        export_btn.clicked.connect(self.export_requested.emit)
+        button_layout.addWidget(export_btn)
+
+        clear_btn = QPushButton("결과 지우기")
+        clear_btn.clicked.connect(self.clear_results)
+        button_layout.addWidget(clear_btn)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def setup_result_tree(self):
+        """결과 트리 설정"""
+        # 컬럼 설정
+        headers = ["전화번호", "라이브러리", "상태", "세션 문자열"]
+        self.result_tree.setHeaderLabels(headers)
+
+        # 헤더 설정
+        header = self.result_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+
+        # 더블클릭 이벤트
+        self.result_tree.itemDoubleClicked.connect(self.on_item_double_clicked)
+
+        # 컨텍스트 메뉴
+        self.result_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.result_tree.customContextMenuRequested.connect(self.show_context_menu)
+
+    def add_result(self, result: Dict):
+        """결과 추가"""
+        item = QTreeWidgetItem([
+            result['phone'],
+            result['library'],
+            result['status'],
+            result['string_preview']
+        ])
+
+        # 상태에 따른 색상 설정
+        if result['status'] == '성공':
+            item.setForeground(2, QColor("#4CAF50"))
+        else:
+            item.setForeground(2, QColor("#f44336"))
+
+        self.result_tree.addTopLevelItem(item)
+        self.results.append(result)
+
+        # 결과 탭으로 전환
+        self.tab_widget.setCurrentIndex(0)
+
+    def add_log(self, message: str):
+        """로그 추가"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+
+    def copy_selected(self):
+        """선택된 항목 복사"""
+        current_item = self.result_tree.currentItem()
+        if current_item:
+            phone = current_item.text(0)
+            library = current_item.text(1)
+            status = current_item.text(2)
+
+            if status == '성공':
+                self.copy_requested.emit(phone, library)
+
+    def clear_results(self):
+        """결과 초기화"""
+        self.result_tree.clear()
+        self.results.clear()
+        self.clear_requested.emit()
+
+    def on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """아이템 더블클릭"""
+        phone = item.text(0)
+        library = item.text(1)
+        status = item.text(2)
+
+        if status == '성공':
+            self.session_double_clicked.emit(phone, library)
+
+    def show_context_menu(self, position):
+        """컨텍스트 메뉴 표시"""
+        item = self.result_tree.itemAt(position)
+        if not item:
+            return
+
+        menu = QMenu()
+
+        # 복사 액션
+        if item.text(2) == '성공':
+            copy_action = menu.addAction("세션 문자열 복사")
+            copy_action.triggered.connect(lambda: self.copy_requested.emit(
+                item.text(0), item.text(1)
+            ))
+
+            view_action = menu.addAction("상세 보기")
+            view_action.triggered.connect(lambda: self.session_double_clicked.emit(
+                item.text(0), item.text(1)
+            ))
+
+        menu.exec_(self.result_tree.mapToGlobal(position))
+
+    def get_all_results(self) -> List[Dict]:
+        """모든 결과 반환"""
+        return self.results
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/workers/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/gui/workers/session_worker.py
+=====================================
+"""
+백그라운드 세션 생성 워커
+"""
+import asyncio
+import tempfile
+from typing import Dict, List, Optional
+
+from core.session_factory import SessionFactory
+from PyQt5.QtCore import QMutex, QObject, QWaitCondition, pyqtSignal
+from utils.session_utils import extract_session_name
+
+
+class SessionWorker(QObject):
+    """세션 생성 워커"""
+
+    # 시그널 정의
+    progress = pyqtSignal(int)
+    session_created = pyqtSignal(dict)
+    log_message = pyqtSignal(str)
+    auth_required = pyqtSignal(dict)
+    finished = pyqtSignal()
+
+    def __init__(self, api_config: Dict, libraries: List[str], phones: List[str]):
+        super().__init__()
+        self.api_config = api_config
+        self.libraries = libraries
+        self.phones = phones
+        self.stopped = False
+        self.completed = 0
+        self.total = len(libraries) * len(phones)
+
+        # 인증 대기를 위한 동기화 객체
+        self.auth_mutex = QMutex()
+        self.auth_condition = QWaitCondition()
+        self.auth_data = None
+
+    def run(self):
+        """워커 실행"""
+        # 새 이벤트 루프 생성
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self.process_all())
+        finally:
+            loop.close()
+            self.finished.emit()
+
+    async def process_all(self):
+        """모든 세션 처리"""
+        for library in self.libraries:
+            for phone in self.phones:
+                if self.stopped:
+                    self.log_message.emit("처리가 중지되었습니다.")
+                    return
+
+                await self.create_single_session(library, phone)
+
+                self.completed += 1
+                self.progress.emit(self.completed)
+
+    async def create_single_session(self, library: str, phone: str):
+        """단일 세션 생성"""
+        self.log_message.emit(f"[{library}] {phone} 세션 생성 시작...")
+
+        try:
+            # 세션 매니저 생성
+            manager = SessionFactory.create_session_manager(
+                library,
+                self.api_config['api_id'],
+                self.api_config['api_hash']
+            )
+
+            if not manager:
+                self.session_created.emit({
+                    'phone': phone,
+                    'library': library,
+                    'success': False,
+                    'error': '세션 매니저 생성 실패'
+                })
+                return
+
+            # 인증 요청 시그널 발생
+            self.auth_required.emit({
+                'library': library,
+                'phone': phone
+            })
+
+            # 인증 데이터 대기
+            self.auth_mutex.lock()
+            self.auth_condition.wait(self.auth_mutex)
+            auth_data = self.auth_data
+            self.auth_data = None
+            self.auth_mutex.unlock()
+
+            if not auth_data:
+                self.session_created.emit({
+                    'phone': phone,
+                    'library': library,
+                    'success': False,
+                    'error': '인증 취소됨'
+                })
+                return
+
+            # 콜백 함수 정의
+            def code_callback():
+                return auth_data.get('code')
+
+            def password_callback():
+                return auth_data.get('password')
+
+            # 세션 생성 (임시 디렉토리 사용)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                manager.session_dir = temp_dir
+
+                success = await manager.create_session(
+                    phone, code_callback, password_callback
+                )
+
+                if success:
+                    # Base64 문자열 생성
+                    session_string = manager.session_to_string(phone)
+
+                    if session_string:
+                        self.session_created.emit({
+                            'phone': phone,
+                            'library': library,
+                            'success': True,
+                            'session_string': session_string
+                        })
+                        self.log_message.emit(
+                            f"✓ [{library}] {phone} 세션 생성 성공"
+                        )
+                    else:
+                        self.session_created.emit({
+                            'phone': phone,
+                            'library': library,
+                            'success': False,
+                            'error': '세션 문자열 생성 실패'
+                        })
+                else:
+                    self.session_created.emit({
+                        'phone': phone,
+                        'library': library,
+                        'success': False,
+                        'error': '세션 생성 실패'
+                    })
+
+        except Exception as e:
+            self.log_message.emit(f"오류 발생: {str(e)}")
+            self.session_created.emit({
+                'phone': phone,
+                'library': library,
+                'success': False,
+                'error': str(e)
+            })
+
+    def provide_auth(self, auth_data: Optional[Dict]):
+        """인증 데이터 제공"""
+        self.auth_mutex.lock()
+        self.auth_data = auth_data
+        self.auth_condition.wakeAll()
+        self.auth_mutex.unlock()
+
+    def stop(self):
+        """처리 중지"""
+        self.stopped = True
+
+
+
+=====================================
+File: ./src/tg_session_manager/lib/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/lib/pyrogram_session.py
+=====================================
+"""
+Pyrogram 라이브러리를 사용한 세션 관리
+"""
+
+import os
+from typing import Dict, Optional
+
+from core.session_base import SessionBase
+from utils.session_utils import (extract_session_name, session_to_base64,
+                           validate_session_file)
+
+
+class PyrogramSession(SessionBase):
+    """Pyrogram 세션 매니저"""
+
+    async def create_session(
+        self, phone_number: str, code_callback=None, password_callback=None
+    ) -> bool:
+        """Pyrogram 세션 생성"""
+        try:
+            from pyrogram import Client
+            from pyrogram.errors import SessionPasswordNeeded
+
+            session_name = extract_session_name(phone_number)
+
+            app = Client(
+                session_name,
+                api_id=int(self.api_id),
+                api_hash=self.api_hash,
+                workdir=self.session_dir,
+                phone_number=phone_number,
+            )
+
+            await app.connect()
+
+            if not await app.is_user_authorized():
+                sent_code = await app.send_code(phone_number)
+
+                # 인증 코드 입력
+                if code_callback:
+                    code = code_callback()
+                    try:
+                        await app.sign_in(phone_number, sent_code.phone_code_hash, code)
+                    except SessionPasswordNeeded:
+                        # 2FA 처리
+                        if password_callback:
+                            password = password_callback()
+                            await app.check_password(password)
+
+            await app.disconnect()
+            return True
+
+        except Exception as e:
+            print(f"Pyrogram 세션 생성 실패: {e}")
+            return False
+
+    def session_to_string(self, phone_number: str) -> Optional[str]:
+        """세션을 base64 문자열로 변환"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.session")
+        return session_to_base64(session_path)
+
+    def validate_session(self, phone_number: str) -> bool:
+        """세션 유효성 검사"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.session")
+        return validate_session_file(session_path)
+
+    def get_session_info(self, phone_number: str) -> Optional[Dict]:
+        """세션 정보 조회"""
+        if self.validate_session(phone_number):
+            return {"library": "pyrogram", "phone": phone_number, "valid": True}
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/lib/tdlib_session.py
+=====================================
+"""
+TDLib 라이브러리를 사용한 세션 관리
+"""
+
+import asyncio
+import json
+import os
+from typing import Dict, Optional
+
+from core.session_base import SessionBase
+from utils.session_utils import (extract_session_name, session_to_base64,
+                           validate_session_file)
+
+
+class TDLibSession(SessionBase):
+    """TDLib 세션 매니저"""
+
+    def __init__(self, api_id: str, api_hash: str, session_dir: str):
+        super().__init__(api_id, api_hash, session_dir)
+        self.td_client = None
+
+    async def create_session(
+        self, phone_number: str, code_callback=None, password_callback=None
+    ) -> bool:
+        """TDLib 세션 생성"""
+        try:
+            from telegram.client import Telegram
+
+            session_name = extract_session_name(phone_number)
+            db_path = os.path.join(self.session_dir, session_name)
+
+            # TDLib 클라이언트 초기화
+            tg = Telegram(
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                phone=phone_number,
+                database_directory=db_path,
+                files_directory=os.path.join(db_path, "files"),
+                use_message_database=True,
+                use_secret_chats=True,
+                system_language_code="ko",
+                device_model="Desktop",
+                application_version="1.0",
+            )
+
+            # 로그인 상태 확인
+            tg.login()
+
+            # 인증 대기
+            state = tg.get_authorization_state()
+
+            if state["@type"] == "authorizationStateWaitPhoneNumber":
+                # 전화번호 입력
+                tg.send_phone_number(phone_number)
+                state = tg.get_authorization_state()
+
+            if state["@type"] == "authorizationStateWaitCode":
+                # 인증 코드 입력
+                if code_callback:
+                    code = code_callback()
+                    tg.send_code(code)
+                    state = tg.get_authorization_state()
+
+            if state["@type"] == "authorizationStateWaitPassword":
+                # 2FA 비밀번호 입력
+                if password_callback:
+                    password = password_callback()
+                    tg.send_password(password)
+                    state = tg.get_authorization_state()
+
+            # 로그인 완료 확인
+            if state["@type"] == "authorizationStateReady":
+                print("✓ TDLib 세션 생성 성공!")
+
+                # 세션 정보 저장
+                session_info = {
+                    "phone_number": phone_number,
+                    "api_id": self.api_id,
+                    "api_hash": self.api_hash,
+                    "db_path": db_path,
+                    "library": "tdlib",
+                }
+
+                info_path = os.path.join(self.session_dir, f"{session_name}_info.json")
+                with open(info_path, "w") as f:
+                    json.dump(session_info, f, indent=2)
+
+                tg.stop()
+                return True
+
+            tg.stop()
+            return False
+
+        except ImportError:
+            print("python-telegram 패키지가 설치되지 않았습니다.")
+            print("pip install python-telegram 명령으로 설치해주세요.")
+            return False
+        except Exception as e:
+            print(f"TDLib 세션 생성 실패: {e}")
+            return False
+
+    def session_to_string(self, phone_number: str) -> Optional[str]:
+        """세션을 base64 문자열로 변환"""
+        session_name = extract_session_name(phone_number)
+        info_path = os.path.join(self.session_dir, f"{session_name}_info.json")
+        return session_to_base64(info_path)
+
+    def validate_session(self, phone_number: str) -> bool:
+        """세션 유효성 검사"""
+        session_name = extract_session_name(phone_number)
+        db_path = os.path.join(self.session_dir, session_name)
+        info_path = os.path.join(self.session_dir, f"{session_name}_info.json")
+
+        # TDLib 데이터베이스와 정보 파일 모두 확인
+        return os.path.exists(db_path) and os.path.exists(info_path)
+
+    def get_session_info(self, phone_number: str) -> Optional[Dict]:
+        """세션 정보 조회"""
+        if self.validate_session(phone_number):
+            session_name = extract_session_name(phone_number)
+            info_path = os.path.join(self.session_dir, f"{session_name}_info.json")
+
+            try:
+                with open(info_path, "r") as f:
+                    info = json.load(f)
+                    info["valid"] = True
+                    return info
+            except BaseException:
+                pass
+
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/lib/telegram_bot_session.py
+=====================================
+"""
+python-telegram-bot 공식 라이브러리를 사용한 세션 관리
+"""
+
+import asyncio
+import json
+import os
+from typing import Dict, Optional
+
+from core.session_base import SessionBase
+from utils.session_utils import (extract_session_name, session_to_base64,
+                           validate_session_file)
+
+
+class TelegramBotSession(SessionBase):
+    """python-telegram-bot 세션 매니저"""
+
+    async def create_session(
+        self, phone_number: str, code_callback=None, password_callback=None
+    ) -> bool:
+        """python-telegram-bot은 주로 봇용이므로 유저 세션 미지원"""
+        print("python-telegram-bot은 주로 봇 개발용 라이브러리입니다.")
+        print("유저 세션 생성은 Telethon 또는 Pyrogram을 사용하세요.")
+
+        # 비동기 입력을 위한 헬퍼 함수
+        async def async_input(prompt: str) -> str:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, input, prompt)
+
+        # 대신 봇 토큰으로 세션 정보 저장 가능
+        token = await async_input("봇 토큰을 입력하세요 (선택사항, Enter로 건너뛰기): ")
+        if token:
+            session_name = extract_session_name(phone_number)
+            session_path = os.path.join(self.session_dir, f"{session_name}.json")
+
+            session_data = {
+                "bot_token": token,
+                "phone_number": phone_number,
+                "api_id": self.api_id,
+                "api_hash": self.api_hash,
+                "type": "bot",
+            }
+
+            try:
+                # 비동기 파일 쓰기
+                await self._async_write_json(session_path, session_data)
+                print("✓ 봇 세션 정보 저장 완료")
+                return True
+            except Exception as e:
+                print(f"세션 저장 실패: {e}")
+
+        return False
+
+    async def _async_write_json(self, filepath: str, data: dict) -> None:
+        """비동기로 JSON 파일 쓰기"""
+        loop = asyncio.get_event_loop()
+
+        def write_json():
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2)
+
+        await loop.run_in_executor(None, write_json)
+
+    async def _async_read_json(self, filepath: str) -> dict:
+        """비동기로 JSON 파일 읽기"""
+        loop = asyncio.get_event_loop()
+
+        def read_json():
+            with open(filepath, "r") as f:
+                return json.load(f)
+
+        return await loop.run_in_executor(None, read_json)
+
+    def session_to_string(self, phone_number: str) -> Optional[str]:
+        """세션을 base64 문자열로 변환"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.json")
+        return session_to_base64(session_path)
+
+    def validate_session(self, phone_number: str) -> bool:
+        """세션 유효성 검사"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.json")
+
+        if os.path.exists(session_path):
+            try:
+                with open(session_path, "r") as f:
+                    data = json.load(f)
+                    return "bot_token" in data
+            except (json.JSONDecodeError, IOError, OSError) as e:
+                print(f"세션 검증 실패: {e}")
+                return False
+        return False
+
+    def get_session_info(self, phone_number: str) -> Optional[Dict]:
+        """세션 정보 조회"""
+        if self.validate_session(phone_number):
+            return {
+                "library": "python-telegram-bot",
+                "phone": phone_number,
+                "type": "bot",
+                "valid": True,
+            }
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/lib/telethon_session.py
+=====================================
+"""
+Telethon 라이브러리를 사용한 세션 관리
+"""
+
+import os
+from typing import Dict, Optional
+
+from core.session_base import SessionBase
+from utils.session_utils import (extract_session_name, session_to_base64,
+                           validate_session_file)
+
+
+class TelethonSession(SessionBase):
+    """Telethon 세션 매니저"""
+
+    async def create_session(
+        self, phone_number: str, code_callback=None, password_callback=None
+    ) -> bool:
+        """Telethon 세션 생성"""
+        try:
+            from telethon import TelegramClient
+            from telethon.errors import SessionPasswordNeededError
+
+            session_name = extract_session_name(phone_number)
+            session_path = os.path.join(self.session_dir, session_name)
+
+            client = TelegramClient(session_path, int(self.api_id), self.api_hash)
+
+            await client.connect()
+
+            if not await client.is_user_authorized():
+                await client.send_code_request(phone_number)
+
+                # 인증 코드 입력
+                if code_callback:
+                    code = code_callback()
+                    try:
+                        await client.sign_in(phone_number, code)
+                    except SessionPasswordNeededError:
+                        # 2FA 처리
+                        if password_callback:
+                            password = password_callback()
+                            await client.sign_in(password=password)
+
+            await client.disconnect()
+            return True
+
+        except Exception as e:
+            print(f"Telethon 세션 생성 실패: {e}")
+            return False
+
+    def session_to_string(self, phone_number: str) -> Optional[str]:
+        """세션을 base64 문자열로 변환"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.session")
+        return session_to_base64(session_path)
+
+    def validate_session(self, phone_number: str) -> bool:
+        """세션 유효성 검사"""
+        session_name = extract_session_name(phone_number)
+        session_path = os.path.join(self.session_dir, f"{session_name}.session")
+        return validate_session_file(session_path)
+
+    def get_session_info(self, phone_number: str) -> Optional[Dict]:
+        """세션 정보 조회"""
+        if self.validate_session(phone_number):
+            return {"library": "telethon", "phone": phone_number, "valid": True}
+        return None
+
+
+
+=====================================
+File: ./src/tg_session_manager/run_cli.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/run_gui.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/utils/__init__.py
+=====================================
+
+
+
+=====================================
+File: ./src/tg_session_manager/utils/logger.py
+=====================================
+"""
+로깅 시스템 - 세션 생성/실패/삭제 등 이벤트 기록
+"""
+
+import logging
+import os
+from datetime import datetime
+from typing import Optional
+
+from config.config import BASE_DIR
+
+
+class SessionLogger:
+    """세션 관리 로거"""
+
+    def __init__(self, log_file: Optional[str] = None):
+        if log_file is None:
+            log_dir = os.path.join(BASE_DIR, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(
+                log_dir, f"session_{datetime.now().strftime('%Y%m%d')}.log"
+            )
+
+        # 로거 설정
+        self.logger = logging.getLogger("SessionManager")
+        self.logger.setLevel(logging.INFO)
+
+        # 파일 핸들러
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+
+        # 콘솔 핸들러
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+
+        # 포맷터
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+
+        # 핸들러 추가
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+
+    def log_session_created(self, library: str, phone: str, success: bool):
+        """세션 생성 로그"""
+        if success:
+            self.logger.info("세션 생성 성공: %s - %s", library, phone)
+        else:
+            self.logger.error("세션 생성 실패: %s - %s", library, phone)
+
+    def log_authentication(self, phone: str, attempt: int, success: bool):
+        """인증 시도 로그"""
+        if success:
+            self.logger.info("인증 성공: %s (시도 %d)", phone, attempt)
+        else:
+            self.logger.warning("인증 실패: %s (시도 %d)", phone, attempt)
+
+    def log_backup(self, original_path: str, backup_path: str):
+        """백업 로그"""
+        self.logger.info("세션 백업: %s -> %s", original_path, backup_path)
+
+    def log_api_registered(self, api_name: str):
+        """API 등록 로그"""
+        self.logger.info("API 등록: %s", api_name)
+
+    def log_error(self, error_msg: str):
+        """에러 로그"""
+        self.logger.error("에러: %s", error_msg)
+
+
+
+=====================================
+File: ./src/tg_session_manager/utils/session_utils.py
+=====================================
+"""
+세션 유틸리티 - 세션명 추출, base64 변환, 유효성 검사
+"""
+
+import base64
+import os
+import shutil
+from datetime import datetime
+from typing import Optional
+
+
+def extract_session_name(phone_number: str) -> str:
+    """전화번호에서 세션명 추출 (뒷 8자리)"""
+    # 숫자만 추출
+    numbers_only = "".join(filter(str.isdigit, phone_number))
+    # 뒷 8자리 반환, 8자리 미만이면 전체 반환
+    return numbers_only[-8:] if len(numbers_only) >= 8 else numbers_only
+
+
+def session_to_base64(session_file_path: str) -> Optional[str]:
+    """세션 파일을 base64 문자열로 변환"""
+    try:
+        if os.path.exists(session_file_path):
+            with open(session_file_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+    except (IOError, OSError) as e:
+        print(f"세션 파일 변환 실패: {e}")
+    return None
+
+
+def base64_to_session(base64_string: str, output_path: str) -> bool:
+    """base64 문자열을 세션 파일로 복구"""
+    try:
+        session_data = base64.b64decode(base64_string)
+        with open(output_path, "wb") as f:
+            f.write(session_data)
+        return True
+    except (ValueError, IOError, OSError) as e:
+        print(f"세션 복구 실패: {e}")
+        return False
+
+
+def validate_session_file(session_file_path: str) -> bool:
+    """세션 파일 유효성 검사"""
+    # 파일 존재 여부와 크기 확인
+    if os.path.exists(session_file_path):
+        file_size = os.path.getsize(session_file_path)
+        return file_size > 0
+    return False
+
+
+def backup_existing_session(session_file_path: str) -> Optional[str]:
+    """기존 세션 파일 백업"""
+    if os.path.exists(session_file_path):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"{session_file_path}.backup_{timestamp}"
+        try:
+            shutil.copy2(session_file_path, backup_path)
+            return backup_path
+        except (IOError, OSError) as e:
+            print(f"세션 백업 실패: {e}")
+    return None
+
+
+
